@@ -6,18 +6,17 @@ import numpy as np
 import urllib.request
 import json
 import datetime
-import time
 import random
 
 # Cấu hình trang Streamlit
 st.set_page_config(
-    page_title="Bitcoin Real-Time Candlestick & MA Cross Analytics",
+    page_title="Bitcoin Real-Time Candlestick & Volume Stream",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# Custom CSS Dark Theme
+# Custom CSS Dark Theme (TradingView style)
 st.markdown("""
 <style>
     .main { background-color: #0D0E12; }
@@ -38,48 +37,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. TẢI DỮ LIỆU LỊCH SỬ 1 NĂM TỪ COINBASE API ---
-@st.cache_data(ttl=3600)
-def load_1year_btc_history():
-    """Tải 350+ ngày lịch sử giá nến BTC/USD từ Coinbase API"""
-    try:
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            
-        records = []
-        for item in reversed(data): # Từ quá khứ -> hiện tại
-            dt = datetime.datetime.fromtimestamp(item[0])
-            records.append({
-                'time': dt.strftime('%Y-%m-%d'),
-                'datetime': dt,
-                'open': float(item[3]),
-                'high': float(item[2]),
-                'low': float(item[1]),
-                'close': float(item[4]),
-                'volume': float(item[5])
-            })
-        return pd.DataFrame(records)
-    except Exception:
-        dates = pd.date_range(end=datetime.datetime.now(), periods=350, freq='D')
-        prices = [65000.0]
-        for _ in range(349):
-            prices.append(prices[-1] + random.uniform(-800, 850))
-        df = pd.DataFrame({
-            'time': [d.strftime('%Y-%m-%d') for d in dates],
-            'datetime': dates,
-            'open': prices,
-            'high': [p + random.uniform(100, 500) for p in prices],
-            'low': [p - random.uniform(100, 500) for p in prices],
-            'close': prices,
-            'volume': [random.uniform(500, 3000) for _ in prices]
-        })
-        return df
+# Khởi tạo dữ liệu Session State
+if 'candles' not in st.session_state:
+    st.session_state.candles = []
+if 'last_time' not in st.session_state:
+    st.session_state.last_time = None
+if 'last_price' not in st.session_state:
+    st.session_state.last_price = 65000.0
 
-# --- 2. LẤY GIÁ REALTIME SPOT HIỆN TẠI ---
-def fetch_live_btc_tick():
-    """Lấy giá spot realtime từ Coinbase"""
+CANDLE_DURATION_SEC = 5
+
+def fetch_btc_price_and_volume():
+    """Lấy giá BTC/USD realtime từ API Coinbase & Giả lập Volume"""
     try:
         req = urllib.request.Request(
             "https://api.coinbase.com/v2/prices/BTC-USD/spot", 
@@ -87,233 +56,142 @@ def fetch_live_btc_tick():
         )
         with urllib.request.urlopen(req, timeout=2) as response:
             data = json.loads(response.read().decode())
-            return float(data['data']['amount'])
+            price = float(data['data']['amount'])
+            st.session_state.last_price = price
+            tick_vol = round(random.uniform(1.2, 8.5), 2)
+            return price, tick_vol
     except Exception:
-        return None
+        st.session_state.last_price += random.uniform(-15.0, 15.0)
+        tick_vol = round(random.uniform(1.2, 8.5), 2)
+        return round(st.session_state.last_price, 2), tick_vol
 
-# Khởi tạo Session State
-if 'df_history' not in st.session_state:
-    st.session_state.df_history = load_1year_btc_history()
-if 'last_price' not in st.session_state:
-    st.session_state.last_price = st.session_state.df_history['close'].iloc[-1]
+# Tải dữ liệu ban đầu nếu chưa có
+if not st.session_state.candles:
+    initial_p, initial_v = fetch_btc_price_and_volume()
+    now = datetime.datetime.now()
+    st.session_state.candles = [{
+        'time': now.strftime('%H:%M:%S'),
+        'open': initial_p,
+        'high': initial_p,
+        'low': initial_p,
+        'close': initial_p,
+        'volume': initial_v
+    }]
+    st.session_state.last_time = now
 
-# --- 3. TÍNH CHỈ BÁO MA CROSS & SIGNALS ---
-def compute_ma_cross(df, fast_len=20, slow_len=50):
-    df = df.copy()
-    df['SMA_Fast'] = df['close'].rolling(window=fast_len).mean()
-    df['SMA_Slow'] = df['close'].rolling(window=slow_len).mean()
-
-    fast = df['SMA_Fast'].values
-    slow = df['SMA_Slow'].values
-    signals = np.zeros(len(df))
-    for i in range(1, len(df)):
-        if fast[i-1] <= slow[i-1] and fast[i] > slow[i]:
-            signals[i] = 1  # Golden Cross
-        elif fast[i-1] >= slow[i-1] and fast[i] < slow[i]:
-            signals[i] = -1 # Death Cross
-            
-    df['Signal'] = signals
-    return df
-
-# --- SIDEBAR CẤU HÌNH ---
-st.sidebar.title("⚡ BTC Realtime & Zoom Control")
-st.sidebar.markdown("---")
-refresh_sec = st.sidebar.slider("Tần suất nhịp Realtime (Giây)", 1, 5, 2)
-fast_ma = st.sidebar.slider("Đường MA Nhanh (Short MA)", 5, 30, 20)
-slow_ma = st.sidebar.slider("Đường MA Chậm (Long MA)", 30, 100, 50)
-view_range = st.sidebar.selectbox("Phạm vi xem lịch sử", ["1 Năm (Toàn bộ)", "6 Tháng", "3 Tháng", "1 Tháng"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-💡 **Mẹo thao tác Zoom trên biểu đồ:**
-- 🖱️ **Con lăn chuột**: Lăn chuột để Zoom In / Zoom Out.
-- 🤏 **Kéo thả chuột**: Phóng to từng vùng nến cụ thể.
-- 🎚️ **Thanh trượt phía dưới**: Kéo để di chuyển vùng thời gian.
-""")
-
-# --- TIÊU ĐỀ TRANG ---
-st.title("📈 Bitcoin Real-Time Stream & 1-Year MA Cross Analytics")
+# TIÊU ĐỀ TRANG
 st.markdown("""
-<div style='display: flex; align-items: center; gap: 15px; margin-bottom: 15px;'>
-    <span class='status-badge'>● LIVE REALTIME 24/7</span>
-    <span style='color: #888888;'>Nến Nhật 1 năm nối liền giá Realtime + MA Cross + Subplot Volume dưới chân</span>
+<h2 style='text-align: center; color: #F7931A; margin-bottom: 5px;'>BITCOIN REALTIME CANDLESTICK & VOLUME MONITOR</h2>
+<div style='text-align: center; margin-bottom: 20px;'>
+    <span class='status-badge'>● LIVE STREAMING 24/7 (STREAMLIT CLOUD)</span>
 </div>
 """, unsafe_allow_html=True)
 
-# --- XỬ LÝ DỮ LIỆU THỜI GIAN THỰC ---
-now = datetime.datetime.now()
-today_date = now.strftime('%Y-%m-%d')
+# CƠ CHẾ FRAGMENT CHUẨN CỦA STREAMLIT (Cập nhật 1s/lần, 0% chớp nháy, không bao giờ bị nghẽn Server Cloud)
+@st.fragment(run_every="1s")
+def render_realtime_chart():
+    current_price, tick_vol = fetch_btc_price_and_volume()
+    now = datetime.datetime.now()
+    now_str = now.strftime('%H:%M:%S')
 
-live_price = fetch_live_btc_tick()
-if live_price is None:
-    live_price = st.session_state.last_price + random.uniform(-10.0, 10.0)
+    elapsed = (now - st.session_state.last_time).total_seconds()
+    
+    if elapsed >= CANDLE_DURATION_SEC:
+        # Hết 5s -> Mở cây nến mới
+        st.session_state.candles.append({
+            'time': now_str,
+            'open': current_price,
+            'high': current_price,
+            'low': current_price,
+            'close': current_price,
+            'volume': tick_vol
+        })
+        st.session_state.last_time = now
+        
+        # Giữ tối đa 50 cây nến trên màn hình
+        if len(st.session_state.candles) > 50:
+            st.session_state.candles.pop(0)
+    else:
+        # Chưa hết 5s -> Cập nhật nến hiện tại + tích lũy volume
+        curr = st.session_state.candles[-1]
+        curr['close'] = current_price
+        curr['high'] = max(curr['high'], current_price)
+        curr['low'] = min(curr['low'], current_price)
+        curr['volume'] = round(curr['volume'] + tick_vol, 2)
 
-df = st.session_state.df_history.copy()
+    # Đồ thị Nến (Row 1) + Volume (Row 2)
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=[0.75, 0.25]
+    )
 
-if df['time'].iloc[-1] == today_date:
-    df.loc[df.index[-1], 'close'] = live_price
-    df.loc[df.index[-1], 'high'] = max(df['high'].iloc[-1], live_price)
-    df.loc[df.index[-1], 'low'] = min(df['low'].iloc[-1], live_price)
-else:
-    new_row = pd.DataFrame([{
-        'time': today_date,
-        'datetime': now,
-        'open': live_price,
-        'high': live_price,
-        'low': live_price,
-        'close': live_price,
-        'volume': random.uniform(50, 300)
-    }])
-    df = pd.concat([df, new_row], ignore_index=True)
-    st.session_state.df_history = df
+    times = [c['time'] for c in st.session_state.candles]
 
-st.session_state.last_price = live_price
-
-# Tính MA Cross
-df = compute_ma_cross(df, fast_len=fast_ma, slow_len=slow_ma)
-
-# Lọc phạm vi xem
-if view_range == "6 Tháng":
-    df_display = df.tail(180)
-elif view_range == "3 Tháng":
-    df_display = df.tail(90)
-elif view_range == "1 Tháng":
-    df_display = df.tail(30)
-else:
-    df_display = df
-
-# --- RENDER GIAO DIỆN ---
-c1, c2, c3, c4 = st.columns(4)
-latest_close = df['close'].iloc[-1]
-prev_close = df['close'].iloc[-2]
-diff = latest_close - prev_close
-pct = (diff / prev_close) * 100
-
-c1.metric("Giá Bitcoin Realtime", f"${latest_close:,.2f}", f"{diff:+.2f} USD ({pct:+.2f}%)")
-c2.metric(f"SMA {fast_ma} (Nhanh)", f"${df['SMA_Fast'].iloc[-1]:,.2f}")
-c3.metric(f"SMA {slow_ma} (Chậm)", f"${df['SMA_Slow'].iloc[-1]:,.2f}")
-
-ma_status = "🟢 BULLISH (Tăng)" if df['SMA_Fast'].iloc[-1] >= df['SMA_Slow'].iloc[-1] else "🔴 BEARISH (Giảm)"
-c4.metric("Xu hướng MA Cross", ma_status, f"Tổng số ngày: {len(df)}")
-
-st.markdown("---")
-
-# ĐỒ THỊ 2 TẦNG (Row 1: Nến + MA Cross + Tín hiệu, Row 2: Volume)
-fig = make_subplots(
-    rows=2, cols=1,
-    shared_xaxes=True,
-    vertical_spacing=0.03,
-    row_heights=[0.75, 0.25]
-)
-
-# 1. Nến Nhật Rõ Nét (Row 1)
-fig.add_trace(
-    go.Candlestick(
-        x=df_display['time'],
-        open=df_display['open'],
-        high=df_display['high'],
-        low=df_display['low'],
-        close=df_display['close'],
-        increasing_line_color='#00E676', increasing_line_width=1.5,
-        increasing_fillcolor='#00E676',
-        decreasing_line_color='#FF5252', decreasing_line_width=1.5,
-        decreasing_fillcolor='#FF5252',
-        name='BTC/USD Candlestick'
-    ), row=1, col=1
-)
-
-# 2. MA Nhanh & MA Chậm
-fig.add_trace(
-    go.Scatter(
-        x=df_display['time'], y=df_display['SMA_Fast'],
-        mode='lines', line=dict(color='#FFD700', width=2),
-        name=f'SMA {fast_ma} (Short)'
-    ), row=1, col=1
-)
-
-fig.add_trace(
-    go.Scatter(
-        x=df_display['time'], y=df_display['SMA_Slow'],
-        mode='lines', line=dict(color='#00BFFF', width=2),
-        name=f'SMA {slow_ma} (Long)'
-    ), row=1, col=1
-)
-
-# 3. Tín hiệu Golden Cross & Death Cross
-golden_df = df_display[df_display['Signal'] == 1]
-death_df = df_display[df_display['Signal'] == -1]
-
-if not golden_df.empty:
+    # 1. Vẽ Nến Nhật rõ nét
     fig.add_trace(
-        go.Scatter(
-            x=golden_df['time'], y=golden_df['low'] * 0.97,
-            mode='markers+text',
-            marker=dict(symbol='triangle-up', size=14, color='#00E676'),
-            text=['🚀 GOLDEN CROSS'] * len(golden_df),
-            textposition='bottom center',
-            name='Golden Cross (BUY)'
+        go.Candlestick(
+            x=times,
+            open=[c['open'] for c in st.session_state.candles],
+            high=[c['high'] for c in st.session_state.candles],
+            low=[c['low'] for c in st.session_state.candles],
+            close=[c['close'] for c in st.session_state.candles],
+            increasing_line_color='#00E676', increasing_line_width=1.5,
+            increasing_fillcolor='#00E676',
+            decreasing_line_color='#FF5252', decreasing_line_width=1.5,
+            decreasing_fillcolor='#FF5252',
+            name='BTC/USD'
         ), row=1, col=1
     )
 
-if not death_df.empty:
+    # 2. Vẽ Volume Đỏ / Xanh
+    vol_colors = ['#00E676' if c['close'] >= c['open'] else '#FF5252' for c in st.session_state.candles]
     fig.add_trace(
-        go.Scatter(
-            x=death_df['time'], y=death_df['high'] * 1.03,
-            mode='markers+text',
-            marker=dict(symbol='triangle-down', size=14, color='#FF5252'),
-            text=['📉 DEATH CROSS'] * len(death_df),
-            textposition='top center',
-            name='Death Cross (SELL)'
-        ), row=1, col=1
+        go.Bar(
+            x=times,
+            y=[c['volume'] for c in st.session_state.candles],
+            marker_color=vol_colors,
+            name='Volume',
+            showlegend=False
+        ), row=2, col=1
     )
 
-# 4. Volume Đỏ/Xanh dưới chân (Row 2)
-vol_colors = ['#00E676' if c >= o else '#FF5252' for c, o in zip(df_display['close'], df_display['open'])]
+    fig.update_layout(
+        title={
+            'text': f"Bitcoin Live Realtime Stream (Khung nến {CANDLE_DURATION_SEC}s)",
+            'x': 0.5, 'xanchor': 'center',
+            'font': {'size': 18, 'color': '#F7931A'}
+        },
+        template="plotly_dark",
+        height=620,
+        uirevision='btc_streamlit_constant', # Tuyệt đối không chớp nháy
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis_rangeslider_visible=False,
+        xaxis2=dict(
+            title="Thời gian (Dùng con lăn chuột để Zoom In/Out / Kéo thanh trượt bên dưới)",
+            showgrid=True, gridcolor='#222222',
+            rangeslider=dict(visible=True, thickness=0.08, bgcolor='#1E2026')
+        ),
+        yaxis1=dict(title="Giá BTC (USD)", tickprefix="$", showgrid=True, gridcolor='#222222'),
+        yaxis2=dict(title="Volume", showgrid=True, gridcolor='#222222')
+    )
 
-fig.add_trace(
-    go.Bar(
-        x=df_display['time'], y=df_display['volume'],
-        marker_color=vol_colors,
-        name='Volume',
-        showlegend=False
-    ), row=2, col=1
-)
+    # Metric Header
+    latest_c = st.session_state.candles[-1]['close']
+    prev_c = st.session_state.candles[-2]['close'] if len(st.session_state.candles) > 1 else latest_c
+    diff = latest_c - prev_c
 
-fig.update_layout(
-    title=f"Bitcoin 1-Year History & Realtime Stream (MA Cross {fast_ma}/{slow_ma} & Volume)",
-    template="plotly_dark",
-    height=680,
-    uirevision='btc_1yr_macross_view',
-    margin=dict(l=20, r=20, t=40, b=20),
-    xaxis_rangeslider_visible=False,
-    xaxis2=dict(
-        title="Thời gian (Dùng con lăn chuột để Zoom In/Out / Kéo thanh trượt để xem 1 năm)",
-        showgrid=True, gridcolor='#222222',
-        rangeslider=dict(visible=True, thickness=0.06, bgcolor='#1E2026')
-    ),
-    yaxis1=dict(title="Giá BTC (USD)", tickprefix="$", showgrid=True, gridcolor='#222222'),
-    yaxis2=dict(title="Volume", showgrid=True, gridcolor='#222222')
-)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Giá Bitcoin Live Spot", f"${latest_c:,.2f}", f"{diff:+.2f} USD")
+    m2.metric("Số cây nến hiển thị", len(st.session_state.candles))
+    m3.metric("Khung thời gian nến", f"{CANDLE_DURATION_SEC} giây / nến")
 
-# Render Plotly Chart với chế độ scrollZoom = True cho phép dùng con lăn chuột Zoom mượt mà
-st.plotly_chart(
-    fig, 
-    use_container_width=True,
-    config={
-        'scrollZoom': True,
-        'displayModeBar': True,
-        'displaylogo': False
-    }
-)
+    # Render Plotly Chart với chế độ Zoom mượt
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={'scrollZoom': True, 'displayModeBar': True, 'displaylogo': False}
+    )
 
-# Lịch sử tín hiệu
-signals_log = df_display[df_display['Signal'] != 0][['time', 'close', 'SMA_Fast', 'SMA_Slow', 'Signal']].copy()
-if not signals_log.empty:
-    signals_log['Tín hiệu'] = signals_log['Signal'].apply(lambda x: "🟢 GOLDEN CROSS (TĂNG/MUA)" if x == 1 else "🔴 DEATH CROSS (GIẢM/BÁN)")
-    signals_log['Giá BTC'] = signals_log['close'].apply(lambda x: f"${x:,.2f}")
-    st.markdown("##### 📋 Lịch sử Điểm cắt MA Cross gần đây:")
-    st.dataframe(signals_log[['time', 'Tín hiệu', 'Giá BTC']].sort_values(by='time', ascending=False), hide_index=True, use_container_width=True)
-
-# Cơ chế Rerun mượt mà của Streamlit
-time.sleep(refresh_sec)
-st.rerun()
+render_realtime_chart()
